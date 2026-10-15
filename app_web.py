@@ -1,0 +1,1719 @@
+# =============================================================================
+# KHAN HERBAL STORES — WEB FACTORY v2.1 (Complete)
+# =============================================================================
+# Single-file Flask app. Merged from Part 1 + Part 2 + image attach fix.
+#
+# v2.1 FIXES:
+#   - Push WP route now handles 4 return values from media.upload_gallery_to_wp
+#   - Push WC route passes media_urls (fallback for images)
+#   - Reports "0 images attached" warnings
+# =============================================================================
+
+# =============================================================================
+# SECTION 1 — IMPORTS
+# =============================================================================
+import os
+import sys
+import csv
+import io
+import re
+import json
+import time
+import uuid
+import socket
+import base64
+import threading
+import webbrowser
+import datetime
+from pathlib import Path
+
+try:
+    from flask import Flask, request, jsonify, session, send_file, Response
+except ImportError:
+    print("ERROR: Flask not installed. Run: pip install Flask")
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("ERROR: requests not installed.")
+    sys.exit(1)
+
+try:
+    import engine
+    import media
+    CUSTOM_MODULES = True
+except ImportError as e:
+    engine = None
+    media = None
+    CUSTOM_MODULES = False
+    print(f"WARNING: engine.py or media.py missing: {e}")
+
+# =============================================================================
+# SECTION 2 — CONSTANTS
+# =============================================================================
+APP_NAME = "Khan Herbal Stores — Web Factory"
+APP_VERSION = "2.1.0"
+DEFAULT_PORT = 5000
+
+SITE_URL = "https://darkcyan-turkey-703045.hostingersite.com"
+CURRENCY_CODE = "PKR"
+CURRENCY_SYMBOL = "Rs"
+PRICE_MIN = 199
+PRICE_MAX = 999
+PRODUCT_COUNT = 325
+
+WORKSPACE = Path.cwd() / "workspace"
+UPLOAD_DIR = WORKSPACE / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = Path.cwd() / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+STORE_DEFAULTS = {
+    "name":           "Khan Herbal Stores",
+    "tagline":        "Authentic Herbal Remedies in Pakistan",
+    "description":    "Pakistan's trusted online store for pure, natural and authentic herbal products.",
+    "email":          "info@khanherbalstores.com",
+    "phone":          "+92 300 0000000",
+    "whatsapp":       "+923218224219",
+    "address_line1":  "Main Market",
+    "address_line2":  "",
+    "city":           "Karachi",
+    "state":          "Sindh",
+    "country":        "PK",
+    "postal_code":    "74000",
+    "business_hours": "Mon-Sat 9:00 AM - 9:00 PM",
+    "facebook":       "",
+    "instagram":      "",
+    "youtube":        "",
+    "twitter":        "",
+    "license_type":   "Commercial Single-Site",
+    "license_to":     "Khan Herbal Stores",
+    "license_key":    "",
+    "support_email":  "support@khanherbalstores.com",
+}
+
+# =============================================================================
+# SECTION 3 — FLASK + SESSIONS
+# =============================================================================
+app = Flask(__name__)
+app.secret_key = "khan-herbal-stores-factory-2026-secret"
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+SESSIONS = {}
+
+
+def get_session_data():
+    if "sid" not in session:
+        session["sid"] = str(uuid.uuid4())
+    sid = session["sid"]
+    if sid not in SESSIONS:
+        SESSIONS[sid] = {
+            "wp": {"connected": False, "url": "", "user": "", "pass": ""},
+            "wc": {"connected": False, "url": "", "ck": "", "cs": ""},
+            "pexels_key": "",
+            "raw_products": [],
+            "built_products": [],
+            "slot_managers": {},
+            "activity_log": [],
+            "store": dict(STORE_DEFAULTS),
+        }
+    return SESSIONS[sid]
+
+
+def log_activity(action, result="", detail=""):
+    s = get_session_data()
+    s["activity_log"].append({
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "action": action, "result": result,
+        "detail": _redact(detail)[:200],
+    })
+    if len(s["activity_log"]) > 500:
+        s["activity_log"] = s["activity_log"][-500:]
+
+
+def _redact(text):
+    if not isinstance(text, str): text = str(text)
+    for p in [r"ck_[A-Za-z0-9]{20,}", r"cs_[A-Za-z0-9]{20,}",
+              r"(?i)(authorization|bearer|password|secret)\s*[:=]\s*\S+"]:
+        text = re.sub(p, "***", text)
+    return text
+
+
+# =============================================================================
+# SECTION 4 — CSS
+# =============================================================================
+CSS = r"""
+:root{--bg:#f5f7fa;--bg-card:#fff;--bg-elev:#f0f2f5;--text:#1a202c;--muted:#64748b;
+  --border:#e2e8f0;--primary:#2e7d32;--primary-h:#1b5e20;--primary-l:#e8f5e9;
+  --danger:#dc2626;--warn:#f59e0b;--info:#2563eb;--gold:#d97706;
+  --shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --shadow-lg:0 10px 25px rgba(0,0,0,.08);
+  --r:10px;--r-sm:6px;--hh:64px;--th:52px}
+[data-theme="dark"]{--bg:#0f172a;--bg-card:#1e293b;--bg-elev:#334155;--text:#f1f5f9;
+  --muted:#94a3b8;--border:#334155;--primary:#4ade80;--primary-h:#22c55e;
+  --primary-l:#14321e;--shadow:0 1px 3px rgba(0,0,0,.3);--shadow-lg:0 10px 25px rgba(0,0,0,.4)}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;
+  background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;
+  transition:background .2s,color .2s;overflow:hidden}
+.header{height:var(--hh);background:var(--bg-card);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;padding:0 20px;gap:16px;position:sticky;top:0;
+  z-index:100;box-shadow:var(--shadow)}
+.header .logo{font-size:20px;font-weight:700;color:var(--primary);white-space:nowrap}
+.header .subtitle{color:var(--muted);font-size:12px}
+.header .spacer{flex:1}
+.header .badge{padding:4px 10px;border-radius:12px;font-size:11px;
+  background:var(--bg-elev);color:var(--muted);font-weight:600}
+.theme-toggle{width:40px;height:40px;border-radius:50%;border:1px solid var(--border);
+  background:var(--bg-elev);color:var(--text);font-size:18px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:all .2s}
+.theme-toggle:hover{background:var(--primary-l);border-color:var(--primary)}
+.tabbar{height:var(--th);background:var(--bg-card);border-bottom:1px solid var(--border);
+  display:flex;padding:0 12px;gap:4px;overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:none;position:sticky;top:var(--hh);z-index:99}
+.tabbar::-webkit-scrollbar{display:none}
+.tab-btn{padding:0 16px;border:none;background:transparent;color:var(--muted);
+  font-size:13px;font-weight:600;cursor:pointer;border-bottom:3px solid transparent;
+  transition:all .15s;white-space:nowrap;display:flex;align-items:center;gap:6px}
+.tab-btn:hover{color:var(--text);background:var(--bg-elev)}
+.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);background:var(--primary-l)}
+.main{height:calc(100vh - var(--hh) - var(--th));overflow-y:auto;overflow-x:hidden;
+  padding:20px;scroll-behavior:smooth}
+.main::-webkit-scrollbar{width:10px}
+.main::-webkit-scrollbar-track{background:var(--bg)}
+.main::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
+.tab-content{display:none;max-width:1400px;margin:0 auto}
+.tab-content.active{display:block;animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);
+  padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card h2{font-size:16px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card h3{font-size:14px;margin-bottom:10px;color:var(--muted)}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:600}
+input[type=text],input[type=password],input[type=number],input[type=url],input[type=email],
+input[type=tel],select,textarea{width:100%;padding:10px 12px;border:1px solid var(--border);
+  border-radius:var(--r-sm);background:var(--bg);color:var(--text);font-size:13px;
+  font-family:inherit;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);
+  box-shadow:0 0 0 3px var(--primary-l)}
+[data-theme="dark"] input,[data-theme="dark"] select,[data-theme="dark"] textarea{background:var(--bg-elev)}
+.form-row{margin-bottom:14px}
+.form-row-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.form-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.btn{padding:10px 18px;border-radius:var(--r-sm);border:1px solid var(--border);
+  background:var(--bg-card);color:var(--text);font-size:13px;font-weight:600;
+  cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:6px;
+  white-space:nowrap;font-family:inherit}
+.btn:hover{transform:translateY(-1px);box-shadow:var(--shadow-lg)}
+.btn:active{transform:none}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-primary:hover{background:var(--primary-h)}
+.btn-danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+.btn-info{background:var(--info);color:#fff;border-color:var(--info)}
+.btn-warn{background:var(--warn);color:#fff;border-color:var(--warn)}
+.btn-gold{background:var(--gold);color:#fff;border-color:var(--gold)}
+.btn-lg{padding:14px 24px;font-size:14px}
+.btn-block{width:100%;justify-content:center}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap}
+.status{padding:10px 14px;border-radius:var(--r-sm);font-size:13px;
+  display:flex;align-items:center;gap:8px;margin-top:12px}
+.status.ok{background:#dcfce7;color:#166534}
+.status.err{background:#fee2e2;color:#991b1b}
+.status.info{background:#dbeafe;color:#1e40af}
+[data-theme=dark] .status.ok{background:#14321e;color:#86efac}
+[data-theme=dark] .status.err{background:#3b1218;color:#fca5a5}
+[data-theme=dark] .status.info{background:#172554;color:#93c5fd}
+.toast-container{position:fixed;top:80px;right:20px;z-index:9999;display:flex;
+  flex-direction:column;gap:10px;max-width:380px}
+.toast{padding:14px 18px;border-radius:var(--r-sm);background:var(--bg-card);
+  border-left:4px solid var(--primary);box-shadow:var(--shadow-lg);color:var(--text);
+  font-size:13px;animation:slideIn .3s ease;display:flex;align-items:flex-start;gap:10px;
+  transition:opacity .3s,transform .3s}
+.toast.error{border-left-color:var(--danger)}
+.toast.warning{border-left-color:var(--warn)}
+.toast.info{border-left-color:var(--info)}
+@keyframes slideIn{from{transform:translateX(400px);opacity:0}to{transform:none;opacity:1}}
+.table-wrap{background:var(--bg-card);border:1px solid var(--border);
+  border-radius:var(--r);overflow:auto;max-height:520px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border)}
+th{background:var(--bg-elev);color:var(--muted);font-weight:700;font-size:11px;
+  text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;z-index:1}
+tr:hover td{background:var(--bg-elev)}
+.dropzone{border:3px dashed var(--border);border-radius:var(--r);padding:36px 20px;
+  text-align:center;background:var(--bg-elev);color:var(--muted);transition:all .2s;
+  cursor:pointer;position:relative}
+.dropzone:hover{border-color:var(--primary);background:var(--primary-l)}
+.dropzone.dragover{border-color:var(--primary);background:var(--primary-l);
+  transform:scale(1.01);box-shadow:0 0 0 6px var(--primary-l)}
+.dropzone .icon{font-size:44px;margin-bottom:10px;display:block}
+.dropzone .title{font-size:15px;font-weight:700;color:var(--text);margin-bottom:4px}
+.dropzone .hint{font-size:12px;margin-top:4px}
+.slots-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:12px}
+.slot{padding:14px 8px;border:2px solid var(--border);border-radius:var(--r-sm);
+  background:var(--bg-elev);text-align:center;font-size:11px;font-weight:700;
+  color:var(--muted);transition:all .2s;position:relative;overflow:hidden;min-height:90px}
+.slot.filled{border-color:var(--primary);background:var(--primary-l);color:var(--primary)}
+.slot.failed{border-color:var(--danger);background:#fee2e2;color:var(--danger)}
+.slot img{max-width:100%;max-height:70px;display:block;margin:0 auto 4px;border-radius:3px}
+.slot .num{font-size:16px;display:block;margin-bottom:2px;font-weight:700}
+.progress{width:100%;height:8px;background:var(--bg-elev);border-radius:4px;
+  overflow:hidden;margin:10px 0}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--primary),var(--primary-h));
+  width:0%;transition:width .3s ease}
+.split{display:grid;grid-template-columns:1.2fr 1fr;gap:16px}
+@media (max-width:1100px){.split{grid-template-columns:1fr}}
+pre.log{background:var(--bg-elev);padding:12px;border-radius:var(--r-sm);
+  font-family:Consolas,monospace;font-size:11px;max-height:340px;overflow-y:auto;
+  color:var(--text);border:1px solid var(--border);white-space:pre-wrap;word-break:break-word}
+.text-muted{color:var(--muted);font-size:12px}
+.text-mono{font-family:Consolas,Monaco,monospace}
+.hidden{display:none !important}
+.mt-8{margin-top:8px}.mt-16{margin-top:16px}.mb-16{margin-bottom:16px}
+.flex{display:flex}.flex-between{display:flex;justify-content:space-between;align-items:center}
+.info-box{background:var(--primary-l);border-left:4px solid var(--primary);
+  padding:16px;border-radius:var(--r-sm);margin-bottom:16px;color:var(--text)}
+.info-box h3{color:var(--primary);margin-bottom:8px}
+.feature-list{list-style:none;padding:0}
+.feature-list li{padding:6px 0;border-bottom:1px dashed var(--border);
+  display:flex;align-items:center;gap:8px}
+.feature-list li:last-child{border-bottom:none}
+.license-badge{display:inline-block;padding:6px 14px;border-radius:20px;
+  background:var(--gold);color:#fff;font-weight:700;font-size:12px}
+.custom-size-row{display:none;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}
+.custom-size-row.visible{display:grid}
+@media (max-width:992px){
+  .grid-4{grid-template-columns:repeat(2,1fr)}
+  .grid-3{grid-template-columns:repeat(2,1fr)}
+  .slots-grid{grid-template-columns:repeat(3,1fr)}
+}
+@media (max-width:768px){
+  :root{--hh:56px;--th:48px}
+  .header{padding:0 12px}.header .logo{font-size:16px}
+  .header .subtitle{display:none}
+  .main{padding:12px}.card{padding:14px}
+  .grid-2,.grid-3,.grid-4,.form-row-2,.form-row-3{grid-template-columns:1fr}
+  .slots-grid{grid-template-columns:repeat(2,1fr)}
+  .toast-container{top:70px;right:10px;left:10px;max-width:none}
+  .tab-btn{padding:0 10px;font-size:12px}
+  .tab-btn .label{display:none}
+  .tab-btn .emoji{font-size:18px}
+}
+"""
+
+# =============================================================================
+# SECTION 5 — HTML BODY
+# =============================================================================
+HTML_BODY = r"""
+<header class="header">
+    <span class="logo">🌿 <span id="store-name-header">Khan Herbal Stores</span></span>
+    <span class="subtitle" id="net-info">Web Factory v2.1</span>
+    <span class="spacer"></span>
+    <span class="badge" id="status-badge">Ready</span>
+    <button class="theme-toggle" id="theme-toggle" title="Toggle theme">🌙</button>
+</header>
+
+<nav class="tabbar">
+    <button class="tab-btn active" data-tab="connections"><span class="emoji">🔌</span><span class="label">Connections</span></button>
+    <button class="tab-btn" data-tab="store"><span class="emoji">⚙️</span><span class="label">Store Settings</span></button>
+    <button class="tab-btn" data-tab="products"><span class="emoji">🏭</span><span class="label">Product Factory</span></button>
+    <button class="tab-btn" data-tab="images"><span class="emoji">🖼️</span><span class="label">Image Studio</span></button>
+    <button class="tab-btn" data-tab="content"><span class="emoji">📝</span><span class="label">Content Engine</span></button>
+    <button class="tab-btn" data-tab="export"><span class="emoji">📤</span><span class="label">Export</span></button>
+    <button class="tab-btn" data-tab="testlab"><span class="emoji">🧪</span><span class="label">Test Lab</span></button>
+    <button class="tab-btn" data-tab="about"><span class="emoji">ℹ️</span><span class="label">About</span></button>
+    <button class="tab-btn" data-tab="log"><span class="emoji">📜</span><span class="label">Log</span></button>
+</nav>
+
+<main class="main" id="main">
+
+    <!-- TAB 1: CONNECTIONS -->
+    <section class="tab-content active" id="tab-connections">
+        <div class="card">
+            <h2>🔵 WordPress Connection</h2>
+            <div class="form-row">
+                <label>Website URL</label>
+                <input type="url" id="wp-url" value="https://darkcyan-turkey-703045.hostingersite.com">
+            </div>
+            <div class="form-row-2">
+                <div class="form-row">
+                    <label>Username</label>
+                    <input type="text" id="wp-user" placeholder="WordPress admin username">
+                </div>
+                <div class="form-row">
+                    <label>Application Password</label>
+                    <input type="password" id="wp-pass" placeholder="xxxx xxxx xxxx xxxx xxxx xxxx">
+                </div>
+            </div>
+            <div class="btn-row">
+                <button class="btn btn-primary" onclick="connectWP()">🔗 Connect</button>
+                <button class="btn" onclick="testWP()">🧪 Test</button>
+                <button class="btn btn-danger" onclick="disconnectWP()">❌ Disconnect</button>
+            </div>
+            <div class="status hidden" id="wp-status"></div>
+        </div>
+        <div class="card">
+            <h2>🟣 WooCommerce Connection</h2>
+            <div class="form-row">
+                <label>Website URL</label>
+                <input type="url" id="wc-url" value="https://darkcyan-turkey-703045.hostingersite.com">
+            </div>
+            <div class="form-row-2">
+                <div class="form-row">
+                    <label>Consumer Key</label>
+                    <input type="text" id="wc-ck" placeholder="ck_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                </div>
+                <div class="form-row">
+                    <label>Consumer Secret</label>
+                    <input type="password" id="wc-cs" placeholder="cs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                </div>
+            </div>
+            <div class="form-row">
+                <label>Pexels API Key (optional)</label>
+                <input type="password" id="pexels-key" placeholder="Optional — get free at pexels.com/api">
+            </div>
+            <div class="btn-row">
+                <button class="btn btn-primary" onclick="connectWC()">🔗 Connect</button>
+                <button class="btn" onclick="testWC()">🧪 Test</button>
+                <button class="btn btn-danger" onclick="disconnectWC()">❌ Disconnect</button>
+            </div>
+            <div class="status hidden" id="wc-status"></div>
+        </div>
+    </section>
+
+    <!-- TAB 2: STORE SETTINGS -->
+    <section class="tab-content" id="tab-store">
+        <div class="card">
+            <h2>⚙️ Store Information</h2>
+            <p class="text-muted mb-16">This info auto-injects into every product footer, schema, and SEO title.</p>
+            <div class="form-row-2">
+                <div class="form-row"><label>Store Name *</label><input type="text" id="store-name" placeholder="Khan Herbal Stores"></div>
+                <div class="form-row"><label>Tagline</label><input type="text" id="store-tagline" placeholder="Authentic Herbal Remedies"></div>
+            </div>
+            <div class="form-row"><label>Store Description</label><textarea id="store-description" rows="2"></textarea></div>
+            <div class="form-row-2">
+                <div class="form-row"><label>Email *</label><input type="email" id="store-email" placeholder="info@example.com"></div>
+                <div class="form-row"><label>Phone *</label><input type="tel" id="store-phone" placeholder="+923218224219"></div>
+            </div>
+            <div class="form-row"><label>WhatsApp</label><input type="tel" id="store-whatsapp" placeholder="+923218224219"></div>
+        </div>
+        <div class="card">
+            <h2>📍 Address</h2>
+            <div class="form-row"><label>Address Line 1</label><input type="text" id="store-addr1" placeholder="Main Market"></div>
+            <div class="form-row"><label>Address Line 2</label><input type="text" id="store-addr2" placeholder="Optional"></div>
+            <div class="form-row-3">
+                <div class="form-row"><label>City</label><input type="text" id="store-city" placeholder="Karachi"></div>
+                <div class="form-row"><label>State</label><input type="text" id="store-state" placeholder="Sindh"></div>
+                <div class="form-row"><label>Postal Code</label><input type="text" id="store-postal" placeholder="74000"></div>
+            </div>
+            <div class="form-row-2">
+                <div class="form-row"><label>Country ISO</label><input type="text" id="store-country" placeholder="PK" maxlength="2"></div>
+                <div class="form-row"><label>Business Hours</label><input type="text" id="store-hours" placeholder="Mon-Sat 9am-9pm"></div>
+            </div>
+        </div>
+        <div class="card">
+            <h2>🌐 Social Media</h2>
+            <div class="form-row-2">
+                <div class="form-row"><label>Facebook URL</label><input type="url" id="store-facebook" placeholder="https://facebook.com/yourpage"></div>
+                <div class="form-row"><label>Instagram URL</label><input type="url" id="store-instagram" placeholder="https://instagram.com/yourpage"></div>
+            </div>
+            <div class="form-row-2">
+                <div class="form-row"><label>YouTube URL</label><input type="url" id="store-youtube" placeholder="https://youtube.com/@channel"></div>
+                <div class="form-row"><label>Twitter URL</label><input type="url" id="store-twitter" placeholder="https://x.com/handle"></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="btn-row">
+                <button class="btn btn-primary btn-lg" onclick="saveStoreSettings()">💾 Save Settings</button>
+                <button class="btn btn-warn" onclick="resetStoreDefaults()">↩️ Reset</button>
+            </div>
+            <div class="status hidden" id="store-status"></div>
+        </div>
+        <div class="card">
+            <h2>📦 Configuration Backup</h2>
+            <div class="btn-row">
+                <button class="btn btn-info" onclick="exportConfig()">📤 Export Config JSON</button>
+                <button class="btn btn-info" onclick="document.getElementById('config-import-file').click()">📥 Import Config JSON</button>
+                <input type="file" id="config-import-file" accept=".json" style="display:none" onchange="importConfig(event)">
+            </div>
+            <div class="status info mt-16">🔒 Exported config does NOT include credentials.</div>
+        </div>
+    </section>
+
+    <!-- TAB 3: PRODUCT FACTORY -->
+    <section class="tab-content" id="tab-products">
+        <div class="card">
+            <h2>🏭 Product Factory</h2>
+            <div class="btn-row mb-16">
+                <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">📂 Load File (.txt/.csv)</button>
+                <button class="btn" onclick="loadDemoProducts()">🎲 Demo (5)</button>
+                <button class="btn btn-danger" onclick="clearProducts()">🧹 Clear</button>
+                <input type="file" id="file-input" accept=".txt,.csv" style="display:none" onchange="uploadProductsFile(event)">
+            </div>
+            <div class="form-row"><label>Paste product names (one per line)</label><textarea id="paste-products" rows="6"></textarea></div>
+            <button class="btn" onclick="loadPastedProducts()">➕ Add to list</button>
+            <div class="grid-4 mt-16">
+                <div class="form-row"><label>Price min (Rs)</label><input type="number" id="price-min" value="199"></div>
+                <div class="form-row"><label>Price max (Rs)</label><input type="number" id="price-max" value="999"></div>
+                <div class="form-row"><label>In-stock count</label><input type="number" id="stock-count" value="10"></div>
+                <div class="form-row"><label>Stock qty</label><input type="number" id="stock-qty" value="25"></div>
+            </div>
+            <button class="btn btn-primary btn-lg btn-block mt-16" onclick="generateProducts()">⚡ Generate All Products</button>
+            <div class="progress hidden" id="gen-progress"><div class="progress-bar"></div></div>
+            <div class="status hidden" id="gen-status"></div>
+        </div>
+        <div class="card">
+            <h2>📋 Products (<span id="prod-count">0</span>)</h2>
+            <div class="table-wrap">
+                <table id="products-table">
+                    <thead><tr><th>#</th><th>Name</th><th>SKU</th><th>Slug</th><th>Price</th><th>Stock</th><th>Category</th><th>RM</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- TAB 4: IMAGE STUDIO -->
+    <section class="tab-content" id="tab-images">
+        <div class="card">
+            <h2>🖼️ Image Studio</h2>
+            <div class="form-row-2 mb-16">
+                <div class="form-row"><label>Select Product</label><select id="img-product" onchange="loadSlots()"></select></div>
+                <div class="form-row"><label>Assign to Slot</label>
+                    <select id="img-slot">
+                        <option value="0">Slot 1 — Featured</option>
+                        <option value="1">Slot 2 — Gallery</option>
+                        <option value="2">Slot 3 — Gallery</option>
+                        <option value="3">Slot 4 — Gallery</option>
+                        <option value="4">Slot 5 — Gallery</option>
+                    </select>
+                </div>
+            </div>
+            <div class="dropzone" id="dropzone" onclick="document.getElementById('img-file-input').click()">
+                <span class="icon">📥</span>
+                <div class="title">Drag & Drop Images Here</div>
+                <div class="hint">Click to browse • Ctrl+V to paste</div>
+                <input type="file" id="img-file-input" accept="image/*" multiple style="display:none" onchange="handleFiles(event.target.files)">
+            </div>
+            <div class="btn-row mt-16">
+                <button class="btn btn-info" onclick="openGoogleImages()">🔍 Google Images</button>
+                <button class="btn btn-info" onclick="openOpenverse()">🖼️ Openverse</button>
+                <button class="btn btn-info" onclick="openPexels()">🎨 Pexels</button>
+            </div>
+            <div class="form-row mt-16">
+                <label>Or paste direct image URL</label>
+                <div class="flex gap-8">
+                    <input type="url" id="img-url-input" placeholder="https://example.com/image.jpg" style="flex:1">
+                    <button class="btn btn-primary" onclick="downloadImageUrl()">⬇️ Download</button>
+                </div>
+            </div>
+            <div class="grid-3 mt-16">
+                <div class="form-row"><label>Image Size</label>
+                    <select id="img-size" onchange="toggleCustomSize()">
+                        <option>300x300</option><option>600x600</option><option>800x800</option>
+                        <option>1200x630</option><option selected>1200x1200</option><option value="Custom">Custom...</option>
+                    </select>
+                </div>
+                <div class="form-row"><label>Aspect Ratio</label>
+                    <select id="img-aspect"><option selected>1:1</option><option>4:3</option><option>16:9</option><option>3:2</option><option>Free</option></select>
+                </div>
+                <div class="form-row"><label>Object-Fit</label>
+                    <select id="img-fit"><option selected>cover</option><option>contain</option><option>fill</option><option>none</option><option>scale-down</option></select>
+                </div>
+            </div>
+            <div class="custom-size-row" id="custom-size-row">
+                <div class="form-row"><label>Custom Width (px)</label><input type="number" id="img-custom-w" value="1200" min="100" max="4000"></div>
+                <div class="form-row"><label>Custom Height (px)</label><input type="number" id="img-custom-h" value="1200" min="100" max="4000"></div>
+            </div>
+            <div class="form-row mt-16">
+                <label>WebP Quality: <span id="quality-display">80</span></label>
+                <input type="range" id="img-quality" min="60" max="100" value="80" oninput="document.getElementById('quality-display').textContent = this.value">
+            </div>
+        </div>
+        <div class="card">
+            <h2>🎯 Slots Preview</h2>
+            <div class="slots-grid" id="slots-grid">
+                <div class="slot"><span class="num">1</span>Featured<br><span class="text-muted">empty</span></div>
+                <div class="slot"><span class="num">2</span>Gallery<br><span class="text-muted">empty</span></div>
+                <div class="slot"><span class="num">3</span>Gallery<br><span class="text-muted">empty</span></div>
+                <div class="slot"><span class="num">4</span>Gallery<br><span class="text-muted">empty</span></div>
+                <div class="slot"><span class="num">5</span>Gallery<br><span class="text-muted">empty</span></div>
+            </div>
+            <div class="status info mt-16" id="img-summary">Select a product.</div>
+        </div>
+    </section>
+
+    <!-- TAB 5: CONTENT ENGINE -->
+    <section class="tab-content" id="tab-content">
+        <div class="card">
+            <h2>📝 Content Engine</h2>
+            <div class="form-row-2 mb-16">
+                <div class="form-row"><label>Select Product</label><select id="content-product" onchange="loadContentPreview()"></select></div>
+                <div class="form-row"><label>RankMath Score</label><input type="text" id="content-score" readonly></div>
+            </div>
+            <div class="split">
+                <div><h3>Article HTML</h3><pre class="log" id="content-article" style="max-height:600px">(select product)</pre></div>
+                <div>
+                    <h3>SEO / RankMath</h3><pre class="log" id="content-seo" style="max-height:250px">—</pre>
+                    <h3 class="mt-16">Keywords</h3><pre class="log" id="content-keywords" style="max-height:340px">—</pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- TAB 6: EXPORT -->
+    <section class="tab-content" id="tab-export">
+        <div class="card">
+            <h2>📤 CSV Export</h2>
+            <div class="btn-row mb-16">
+                <button class="btn btn-primary" onclick="exportCSV(false)">📄 CSV WITHOUT images</button>
+                <button class="btn btn-primary" onclick="exportCSV(true)">🖼️ CSV WITH images</button>
+            </div>
+        </div>
+        <div class="card">
+            <h2>🚀 Push to Live Site</h2>
+            <div class="btn-row mb-16">
+                <button class="btn btn-info" onclick="pushImages()">🖼️ Push Images to WP Media</button>
+                <button class="btn btn-info" onclick="pushProducts()">📦 Push Products to WooCommerce</button>
+            </div>
+            <div class="status info">Products are created as DRAFT. Images auto-attach when both steps run in order.</div>
+        </div>
+        <div class="card">
+            <h2>🎨 Archive CSS</h2>
+            <button class="btn" onclick="downloadArchiveCSS()">💾 Save archive-consistency.css</button>
+        </div>
+        <div class="progress hidden" id="export-progress"><div class="progress-bar"></div></div>
+        <pre class="log hidden" id="export-log"></pre>
+    </section>
+
+    <!-- TAB 7: TEST LAB -->
+    <section class="tab-content" id="tab-testlab">
+        <div class="card">
+            <h2>🧪 Test Lab</h2>
+            <div class="form-row"><label>Products to publish</label><input type="number" id="test-count" value="5" min="1" max="50"></div>
+            <div class="btn-row">
+                <button class="btn btn-warn btn-lg" onclick="publishTestProducts()">🚀 Publish Test Products</button>
+                <button class="btn" onclick="window.open('https://darkcyan-turkey-703045.hostingersite.com/cart/', '_blank')">🛒 Open Cart</button>
+            </div>
+            <pre class="log hidden mt-16" id="test-log"></pre>
+        </div>
+    </section>
+
+    <!-- TAB 8: ABOUT -->
+    <section class="tab-content" id="tab-about">
+        <div class="card">
+            <div class="info-box">
+                <h3>🌿 Khan Herbal Stores — Web Factory</h3>
+                <p>Complete product factory for herbal e-commerce. Generate 325 products with SEO articles, RankMath metadata, internal linking, and WebP images.</p>
+            </div>
+            <div class="flex-between mb-16">
+                <div><h3>Version</h3><p class="text-mono">v2.1.0</p></div>
+                <div><h3>License</h3><span class="license-badge" id="license-badge">Commercial Single-Site</span></div>
+            </div>
+        </div>
+        <div class="card">
+            <h2>🎁 Features</h2>
+            <ul class="feature-list">
+                <li>✅ 325 products generation</li>
+                <li>✅ SEO articles 1000+ words @ 90% RankMath</li>
+                <li>✅ Keyword density 1.0–1.5%</li>
+                <li>✅ Duplicate prevention (formula templates)</li>
+                <li>✅ Internal linking (17 pages + 4 related)</li>
+                <li>✅ Store home link + brand anchor</li>
+                <li>✅ Contact footer auto-injected</li>
+                <li>✅ WebP pipeline with custom sizes</li>
+                <li>✅ CSV export (with/without images)</li>
+                <li>✅ WP Media + WC Product API push</li>
+                <li>✅ Dark/Light mode + mobile + WiFi</li>
+                <li>✅ Config export/import</li>
+            </ul>
+        </div>
+        <div class="card">
+            <h2>📋 License</h2>
+            <div class="grid-2">
+                <div class="form-row"><label>License Type</label><input type="text" id="license-type"></div>
+                <div class="form-row"><label>Licensed To</label><input type="text" id="license-to"></div>
+            </div>
+            <div class="form-row"><label>License Key</label><input type="text" id="license-key"></div>
+            <div class="form-row"><label>Support Email</label><input type="email" id="support-email"></div>
+            <button class="btn btn-primary" onclick="saveLicenseInfo()">💾 Save License Info</button>
+        </div>
+        <div class="card">
+            <h2>💬 Support</h2>
+            <p>Contact: <strong id="support-contact">support@khanherbalstores.com</strong></p>
+        </div>
+    </section>
+
+    <!-- TAB 9: LOG -->
+    <section class="tab-content" id="tab-log">
+        <div class="card">
+            <h2>📜 Activity Log</h2>
+            <div class="table-wrap">
+                <table id="log-table">
+                    <thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Detail</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="btn-row mt-16">
+                <button class="btn" onclick="refreshLog()">🔄 Refresh</button>
+                <button class="btn btn-danger" onclick="clearLog()">🧹 Clear</button>
+            </div>
+        </div>
+    </section>
+
+</main>
+<div class="toast-container" id="toasts"></div>
+"""
+
+# =============================================================================
+# SECTION 6 — JAVASCRIPT
+# =============================================================================
+JS = r"""
+// THEME
+(function(){
+    const t = localStorage.getItem('theme') || 'light';
+    document.documentElement.setAttribute('data-theme', t);
+    document.getElementById('theme-toggle').textContent = t==='dark' ? '☀️' : '🌙';
+})();
+document.getElementById('theme-toggle').addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme');
+    const next = cur==='dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+    document.getElementById('theme-toggle').textContent = next==='dark' ? '☀️' : '🌙';
+});
+
+// TABS
+document.querySelectorAll('.tab-btn').forEach(b => {
+    b.addEventListener('click', () => {
+        const t = b.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach(x => x.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        document.getElementById('tab-'+t).classList.add('active');
+        document.getElementById('main').scrollTop = 0;
+        if (t === 'log') refreshLog();
+        if (t === 'products') refreshProductsTable();
+        if (t === 'images') refreshImageProductDropdown();
+        if (t === 'content') refreshContentProductDropdown();
+        if (t === 'store' || t === 'about') loadStoreSettings();
+    });
+});
+
+// TOAST
+function toast(msg, type='ok', dur=4000){
+    const c = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + (type==='ok' ? '' : type);
+    el.innerHTML = `<span>${type==='ok'?'✅':type==='error'?'❌':'⚠️'}</span><span>${msg}</span>`;
+    c.appendChild(el);
+    setTimeout(()=>{
+        el.style.opacity = '0'; el.style.transform = 'translateX(400px)';
+        setTimeout(()=>el.remove(), 300);
+    }, dur);
+}
+function setStatus(text, ok=true){
+    const b = document.getElementById('status-badge');
+    b.textContent = text; b.style.color = ok ? 'var(--primary)' : 'var(--danger)';
+}
+function showStatus(id, msg, type='ok'){
+    const el = document.getElementById(id);
+    el.className = 'status ' + type;
+    el.textContent = (type==='ok'?'✅ ':type==='err'?'❌ ':'ℹ️ ') + msg;
+    el.classList.remove('hidden');
+}
+async function api(url, options={}){
+    try {
+        const res = await fetch(url, {
+            method: options.method || 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: options.body ? JSON.stringify(options.body) : undefined,
+        });
+        return await res.json();
+    } catch(e){ return {ok:false, error:'Network: '+e.message}; }
+}
+
+// CONNECTIONS
+async function connectWP(){
+    const d = await api('/api/connect/wp', {body:{url: document.getElementById('wp-url').value, user: document.getElementById('wp-user').value, pass: document.getElementById('wp-pass').value}});
+    if (d.ok){ showStatus('wp-status', d.message, 'ok'); toast('WordPress connected'); setStatus('WP ✓'); }
+    else { showStatus('wp-status', d.error, 'err'); toast(d.error, 'error'); setStatus('WP ✗', false); }
+}
+async function testWP(){
+    const d = await api('/api/test/wp', {body:{url: document.getElementById('wp-url').value, user: document.getElementById('wp-user').value, pass: document.getElementById('wp-pass').value}});
+    if (d.ok) toast('WP valid'); else toast(d.error, 'error');
+}
+async function disconnectWP(){
+    await api('/api/disconnect/wp', {body:{}});
+    document.getElementById('wp-pass').value = '';
+    document.getElementById('wp-status').classList.add('hidden');
+    toast('WP disconnected', 'info'); setStatus('Ready');
+}
+async function connectWC(){
+    const d = await api('/api/connect/wc', {body:{url: document.getElementById('wc-url').value, ck: document.getElementById('wc-ck').value, cs: document.getElementById('wc-cs').value, pexels: document.getElementById('pexels-key').value}});
+    if (d.ok){ showStatus('wc-status', d.message, 'ok'); toast('WooCommerce connected'); setStatus('WC ✓'); }
+    else { showStatus('wc-status', d.error, 'err'); toast(d.error, 'error'); setStatus('WC ✗', false); }
+}
+async function testWC(){
+    const d = await api('/api/test/wc', {body:{url: document.getElementById('wc-url').value, ck: document.getElementById('wc-ck').value, cs: document.getElementById('wc-cs').value}});
+    if (d.ok) toast('WC valid'); else toast(d.error, 'error');
+}
+async function disconnectWC(){
+    await api('/api/disconnect/wc', {body:{}});
+    document.getElementById('wc-ck').value = ''; document.getElementById('wc-cs').value = '';
+    document.getElementById('wc-status').classList.add('hidden');
+    toast('WC disconnected', 'info');
+}
+
+// STORE
+async function loadStoreSettings(){
+    const d = await api('/api/store/get', {method:'GET'});
+    if (!d.ok) return;
+    const s = d.store || {};
+    ['name','tagline','description','email','phone','whatsapp',
+     'address_line1','address_line2','city','state','postal_code','country','business_hours',
+     'facebook','instagram','youtube','twitter',
+     'license_type','license_to','license_key','support_email'].forEach(k => {
+        const el = document.getElementById('store-' + k.replace('address_','addr').replace('postal_code','postal').replace('business_hours','hours').replace('license_type','type').replace('license_to','to').replace('license_key','key').replace('support_email','email'));
+        if (!el) return;
+        el.value = s[k] || '';
+    });
+    document.getElementById('license-type').value = s.license_type || '';
+    document.getElementById('license-to').value = s.license_to || '';
+    document.getElementById('license-key').value = s.license_key || '';
+    document.getElementById('support-email').value = s.support_email || '';
+    document.getElementById('store-name-header').textContent = s.name || 'Herbal Store';
+    document.getElementById('license-badge').textContent = s.license_type || 'Commercial';
+    document.getElementById('support-contact').textContent = s.support_email || 'support@example.com';
+}
+async function saveStoreSettings(){
+    const store = {
+        name: document.getElementById('store-name').value,
+        tagline: document.getElementById('store-tagline').value,
+        description: document.getElementById('store-description').value,
+        email: document.getElementById('store-email').value,
+        phone: document.getElementById('store-phone').value,
+        whatsapp: document.getElementById('store-whatsapp').value,
+        address_line1: document.getElementById('store-addr1').value,
+        address_line2: document.getElementById('store-addr2').value,
+        city: document.getElementById('store-city').value,
+        state: document.getElementById('store-state').value,
+        postal_code: document.getElementById('store-postal').value,
+        country: document.getElementById('store-country').value,
+        business_hours: document.getElementById('store-hours').value,
+        facebook: document.getElementById('store-facebook').value,
+        instagram: document.getElementById('store-instagram').value,
+        youtube: document.getElementById('store-youtube').value,
+        twitter: document.getElementById('store-twitter').value,
+    };
+    const d = await api('/api/store/save', {body: store});
+    if (d.ok){ showStatus('store-status','Saved','ok'); toast('Store saved'); document.getElementById('store-name-header').textContent = store.name || 'Herbal Store'; }
+    else { showStatus('store-status', d.error, 'err'); toast(d.error, 'error'); }
+}
+async function resetStoreDefaults(){
+    if (!confirm('Reset store to defaults?')) return;
+    const d = await api('/api/store/reset', {body:{}});
+    if (d.ok){ toast('Reset'); loadStoreSettings(); }
+}
+async function saveLicenseInfo(){
+    const d = await api('/api/store/license', {body:{
+        license_type: document.getElementById('license-type').value,
+        license_to: document.getElementById('license-to').value,
+        license_key: document.getElementById('license-key').value,
+        support_email: document.getElementById('support-email').value,
+    }});
+    if (d.ok){ toast('License saved');
+        document.getElementById('license-badge').textContent = document.getElementById('license-type').value;
+        document.getElementById('support-contact').textContent = document.getElementById('support-email').value;
+    }
+}
+async function exportConfig(){
+    const d = await api('/api/config/export', {method:'GET'});
+    if (!d.ok) { toast('Export failed', 'error'); return; }
+    const blob = new Blob([JSON.stringify(d.config, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = 'herbal-store-config-' + new Date().toISOString().slice(0,10) + '.json';
+    a.click(); URL.revokeObjectURL(url); toast('Config exported');
+}
+async function importConfig(evt){
+    const file = evt.target.files[0]; if (!file) return;
+    const text = await file.text();
+    let cfg; try { cfg = JSON.parse(text); } catch(e){ toast('Invalid JSON', 'error'); return; }
+    const d = await api('/api/config/import', {body:{config: cfg}});
+    if (d.ok){ toast('Config imported'); loadStoreSettings(); }
+    else toast(d.error || 'Import failed', 'error');
+    evt.target.value = '';
+}
+
+// PRODUCTS
+async function uploadProductsFile(evt){
+    const file = evt.target.files[0]; if (!file) return;
+    const fd = new FormData(); fd.append('file', file);
+    const res = await fetch('/api/products/load', { method:'POST', body:fd });
+    const d = await res.json();
+    if (d.ok){ toast(`${d.count} products loaded`); refreshProductsTable(); }
+    else toast(d.error, 'error');
+    evt.target.value = '';
+}
+async function loadPastedProducts(){
+    const text = document.getElementById('paste-products').value;
+    if (!text.trim()){ toast('Paste products first', 'warning'); return; }
+    const d = await api('/api/products/load-text', {body:{text}});
+    if (d.ok){ toast(`${d.count} added`); refreshProductsTable(); document.getElementById('paste-products').value=''; }
+}
+async function loadDemoProducts(){
+    const d = await api('/api/products/load-demo', {body:{}});
+    if (d.ok){ toast(`${d.count} demo loaded`); refreshProductsTable(); }
+}
+async function clearProducts(){
+    await api('/api/products/clear', {body:{}});
+    toast('Cleared', 'info'); refreshProductsTable();
+}
+async function generateProducts(){
+    const prog = document.getElementById('gen-progress');
+    prog.classList.remove('hidden');
+    prog.querySelector('.progress-bar').style.width = '30%';
+    showStatus('gen-status', 'Generating…', 'info');
+    const d = await api('/api/products/generate', {body:{
+        price_min: document.getElementById('price-min').value,
+        price_max: document.getElementById('price-max').value,
+        stock_count: document.getElementById('stock-count').value,
+        stock_qty: document.getElementById('stock-qty').value,
+    }});
+    prog.querySelector('.progress-bar').style.width = '100%';
+    setTimeout(()=>prog.classList.add('hidden'), 800);
+    if (d.ok){
+        showStatus('gen-status', `Generated ${d.count}. RM avg: ${d.avg_score}%, Passing: ${d.passing}`, 'ok');
+        toast(`${d.count} generated`);
+        refreshProductsTable(); refreshImageProductDropdown(); refreshContentProductDropdown();
+    } else { showStatus('gen-status', d.error, 'err'); toast(d.error, 'error'); }
+}
+async function refreshProductsTable(){
+    const d = await api('/api/products/list', {method:'GET'});
+    const tbody = document.querySelector('#products-table tbody');
+    tbody.innerHTML = '';
+    document.getElementById('prod-count').textContent = d.count || 0;
+    (d.products || []).forEach(p => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${p.index}</td><td>${p.name}</td><td>${p.sku}</td>
+            <td class="text-mono">${p.slug}</td><td>Rs ${p.price.toFixed(2)}</td>
+            <td>${p.stock}</td><td>${p.category_name}</td>
+            <td style="color:${p.rankmath_score>=70?'var(--primary)':'var(--warn)'};font-weight:700">${p.rankmath_score}%</td>`;
+        tbody.appendChild(tr);
+    });
+}
+
+// IMAGES
+function toggleCustomSize(){
+    const sel = document.getElementById('img-size').value;
+    const row = document.getElementById('custom-size-row');
+    if (sel === 'Custom') row.classList.add('visible'); else row.classList.remove('visible');
+}
+async function refreshImageProductDropdown(){
+    const d = await api('/api/products/list', {method:'GET'});
+    const sel = document.getElementById('img-product');
+    const cur = sel.value; sel.innerHTML = '';
+    if (!d.products || d.products.length === 0){
+        const opt = document.createElement('option');
+        opt.textContent = '(no products)'; opt.value = ''; sel.appendChild(opt); return;
+    }
+    d.products.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.name; opt.textContent = `${p.index}. ${p.name}`; sel.appendChild(opt);
+    });
+    if (cur && [...sel.options].some(o=>o.value===cur)) sel.value = cur;
+    loadSlots();
+}
+async function loadSlots(){
+    const product = document.getElementById('img-product').value;
+    if (!product) return;
+    const d = await api('/api/images/slots', {body:{product}});
+    if (!d.ok) return;
+    const grid = document.getElementById('slots-grid'); grid.innerHTML = '';
+    (d.slots || []).forEach((s, i) => {
+        const cls = s.status === 'ok' ? 'filled' : (s.status === 'failed' ? 'failed' : '');
+        const imgTag = s.thumb_url ? `<img src="${s.thumb_url}">` : '';
+        const label = i === 0 ? 'Featured' : 'Gallery';
+        const status = s.status === 'ok' ? '✓' : (s.status === 'failed' ? '✗' : 'empty');
+        grid.innerHTML += `<div class="slot ${cls}"><span class="num">${i+1}</span>${imgTag}${label}<br><span class="text-muted">${status}</span></div>`;
+    });
+    const ok = d.slots.filter(s=>s.status==='ok').length;
+    const failed = d.slots.filter(s=>s.status==='failed').length;
+    document.getElementById('img-summary').textContent = `${product} — ${ok}/5 complete, ${failed} failed`;
+}
+const dz = document.getElementById('dropzone');
+['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); }));
+['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); }));
+dz.addEventListener('drop', async e => {
+    const files = e.dataTransfer.files;
+    if (files && files.length){ await handleFiles(files); }
+    else {
+        const u = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || e.dataTransfer.getData('text/html');
+        if (u){ const m = u.match(/https?:\/\/[^\s"'<>]+/); if (m){ document.getElementById('img-url-input').value = m[0]; downloadImageUrl(); } }
+    }
+});
+document.addEventListener('paste', async e => {
+    if (!document.getElementById('tab-images').classList.contains('active')) return;
+    const items = e.clipboardData.items; const files = [];
+    for (const it of items){ if (it.type.indexOf('image') !== -1){ const f = it.getAsFile(); if (f) files.push(f); } }
+    if (files.length){ e.preventDefault(); await handleFiles(files); }
+});
+function getImageOptions(){
+    let size = document.getElementById('img-size').value;
+    if (size === 'Custom') size = document.getElementById('img-custom-w').value + 'x' + document.getElementById('img-custom-h').value;
+    return { size, aspect: document.getElementById('img-aspect').value, fit: document.getElementById('img-fit').value, quality: document.getElementById('img-quality').value };
+}
+async function handleFiles(fileList){
+    const product = document.getElementById('img-product').value;
+    if (!product){ toast('Select product first', 'warning'); return; }
+    const slot = document.getElementById('img-slot').value;
+    const opts = getImageOptions();
+    for (const file of fileList){
+        const fd = new FormData();
+        fd.append('file', file); fd.append('product', product); fd.append('slot', slot);
+        fd.append('size', opts.size); fd.append('aspect', opts.aspect); fd.append('fit', opts.fit); fd.append('quality', opts.quality);
+        const res = await fetch('/api/images/upload', { method:'POST', body:fd });
+        const d = await res.json();
+        if (d.ok) toast(`✅ Slot ${parseInt(slot)+1}: ${file.name}`); else toast(d.error || 'Failed', 'error');
+    }
+    loadSlots();
+}
+async function downloadImageUrl(){
+    const product = document.getElementById('img-product').value;
+    if (!product){ toast('Select product', 'warning'); return; }
+    const url = document.getElementById('img-url-input').value.trim();
+    if (!url){ toast('Paste URL', 'warning'); return; }
+    const opts = getImageOptions();
+    toast('Downloading…', 'info');
+    const d = await api('/api/images/download-url', {body:{ product, url, slot: document.getElementById('img-slot').value, ...opts }});
+    if (d.ok){ toast('Downloaded'); document.getElementById('img-url-input').value=''; loadSlots(); }
+    else toast(d.error, 'error');
+}
+function openGoogleImages(){ const p = document.getElementById('img-product').value || 'herbal oil'; window.open('https://www.google.com/search?q='+encodeURIComponent(p+' herbal product')+'&tbm=isch', '_blank'); }
+function openOpenverse(){ const p = document.getElementById('img-product').value || 'herbal oil'; window.open('https://openverse.org/search/?q='+encodeURIComponent(p), '_blank'); }
+function openPexels(){ const p = document.getElementById('img-product').value || 'herbal oil'; window.open('https://www.pexels.com/search/'+encodeURIComponent(p)+'/', '_blank'); }
+
+// CONTENT
+async function refreshContentProductDropdown(){
+    const d = await api('/api/products/list', {method:'GET'});
+    const sel = document.getElementById('content-product');
+    const cur = sel.value; sel.innerHTML = '';
+    if (!d.products || d.products.length === 0){
+        const opt = document.createElement('option'); opt.textContent = '(no products)'; opt.value=''; sel.appendChild(opt); return;
+    }
+    d.products.forEach(p => { const opt = document.createElement('option'); opt.value = p.name; opt.textContent = `${p.index}. ${p.name}`; sel.appendChild(opt); });
+    if (cur && [...sel.options].some(o=>o.value===cur)) sel.value = cur;
+    loadContentPreview();
+}
+async function loadContentPreview(){
+    const name = document.getElementById('content-product').value;
+    if (!name) return;
+    const d = await api('/api/content/product', {body:{name}});
+    if (!d.ok){ document.getElementById('content-article').textContent = d.error; return; }
+    document.getElementById('content-article').textContent = d.article_html || '';
+    document.getElementById('content-seo').textContent = d.seo_text || '';
+    document.getElementById('content-keywords').textContent = d.keywords_text || '';
+    const scoreEl = document.getElementById('content-score');
+    scoreEl.value = d.score + '%' + (d.score >= 70 ? ' ✓ PASS' : ' ⚠');
+    scoreEl.style.color = d.score >= 70 ? 'var(--primary)' : 'var(--warn)';
+}
+
+// EXPORT
+async function exportCSV(withImages){
+    const d = await api('/api/export/csv', {body:{with_images: withImages}});
+    if (d.ok){
+        const blob = new Blob([d.csv], {type:'text/csv'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url;
+        a.download = withImages ? 'products_with_images.csv' : 'products_without_images.csv';
+        a.click(); URL.revokeObjectURL(url); toast('CSV downloaded');
+    } else toast(d.error, 'error');
+}
+async function downloadArchiveCSS(){
+    const d = await api('/api/export/archive-css', {method:'GET'});
+    if (d.ok){
+        const blob = new Blob([d.css], {type:'text/css'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url;
+        a.download = 'archive-consistency.css'; a.click(); URL.revokeObjectURL(url);
+        toast('CSS downloaded');
+    }
+}
+async function pushImages(){
+    const log = document.getElementById('export-log');
+    log.classList.remove('hidden'); log.textContent = 'Pushing images…';
+    const d = await api('/api/push/wp', {body:{}});
+    log.textContent = (d.ok ? '✅ ' : '❌ ') + (d.ok ? d.message : d.error);
+    if (d.errors && d.errors.length) log.textContent += '\n' + d.errors.join('\n');
+    if (d.ok) toast(d.message); else toast(d.error, 'error');
+}
+async function pushProducts(){
+    if (!confirm('Push all products as DRAFT?')) return;
+    const log = document.getElementById('export-log');
+    log.classList.remove('hidden'); log.textContent = 'Pushing products…';
+    const d = await api('/api/push/wc', {body:{}});
+    log.textContent = (d.ok ? '✅ ' : '❌ ') + (d.ok ? d.message : d.error);
+    if (d.errors && d.errors.length) log.textContent += '\n' + d.errors.join('\n');
+    if (d.ok) toast(d.message); else toast(d.error, 'error');
+}
+
+// TEST LAB
+async function publishTestProducts(){
+    const count = document.getElementById('test-count').value;
+    const log = document.getElementById('test-log');
+    log.classList.remove('hidden'); log.textContent = 'Publishing…';
+    const d = await api('/api/test/publish', {body:{count}});
+    log.textContent = (d.ok ? '✅ ' : '❌ ') + (d.ok ? d.message : d.error);
+}
+
+// LOG
+async function refreshLog(){
+    const d = await api('/api/log', {method:'GET'});
+    const tbody = document.querySelector('#log-table tbody'); tbody.innerHTML = '';
+    (d.entries || []).slice().reverse().forEach(e => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td class="text-mono">${e.time}</td><td>${e.action}</td><td>${e.result}</td><td>${e.detail}</td>`;
+        tbody.appendChild(tr);
+    });
+}
+async function clearLog(){ await api('/api/log/clear', {body:{}}); refreshLog(); toast('Cleared', 'info'); }
+
+// INIT
+window.addEventListener('load', async () => {
+    const s = await api('/api/status', {method:'GET'});
+    if (s.wp_connected) setStatus('WP ✓');
+    if (s.wc_connected) setStatus('WC ✓');
+    refreshProductsTable(); refreshImageProductDropdown(); refreshContentProductDropdown();
+    loadStoreSettings();
+    document.getElementById('net-info').textContent = 'v' + s.version;
+});
+"""
+
+
+# =============================================================================
+# SECTION 7 — PAGE ROUTE
+# =============================================================================
+@app.route("/")
+def index():
+    html = f"""<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{APP_NAME}</title>
+<style>{CSS}</style>
+</head>
+<body>
+{HTML_BODY}
+<script>{JS}</script>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    s = get_session_data()
+    return jsonify({"wp_connected": s["wp"]["connected"],
+                    "wc_connected": s["wc"]["connected"],
+                    "products_count": len(s["built_products"]),
+                    "version": APP_VERSION})
+
+
+# =============================================================================
+# SECTION 8 — CONNECTIONS API
+# =============================================================================
+@app.route("/api/connect/wp", methods=["POST"])
+def api_connect_wp():
+    s = get_session_data()
+    d = request.json or {}
+    url = (d.get("url") or SITE_URL).rstrip("/")
+    user = (d.get("user") or "").strip()
+    pw = (d.get("pass") or "").strip()
+    if not user or not pw:
+        return jsonify({"ok": False, "error": "Username/password required"})
+    if not url.startswith("https://"):
+        return jsonify({"ok": False, "error": "HTTPS required"})
+    try:
+        r = requests.get(f"{url}/wp-json/wp/v2/users/me", auth=(user, pw), timeout=15)
+        if r.status_code == 200:
+            s["wp"].update({"connected": True, "url": url, "user": user, "pass": pw})
+            name = r.json().get("name", "?")
+            log_activity("wp_connect", "ok", f"user={name}")
+            return jsonify({"ok": True, "message": f"Connected as {name}"})
+        elif r.status_code == 401: return jsonify({"ok": False, "error": "Invalid credentials (401)"})
+        elif r.status_code == 403: return jsonify({"ok": False, "error": "Insufficient permissions (403)"})
+        return jsonify({"ok": False, "error": f"HTTP {r.status_code}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Network: {str(e)[:150]}"})
+
+
+@app.route("/api/test/wp", methods=["POST"])
+def api_test_wp():
+    d = request.json or {}
+    url = (d.get("url") or SITE_URL).rstrip("/")
+    user = (d.get("user") or "").strip()
+    pw = (d.get("pass") or "").strip()
+    if not user or not pw: return jsonify({"ok": False, "error": "Credentials required"})
+    try:
+        r = requests.get(f"{url}/wp-json/wp/v2/users/me", auth=(user, pw), timeout=15)
+        if r.status_code == 200:
+            return jsonify({"ok": True, "name": r.json().get("name", "?")})
+        return jsonify({"ok": False, "error": f"HTTP {r.status_code}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:150]})
+
+
+@app.route("/api/disconnect/wp", methods=["POST"])
+def api_disconnect_wp():
+    s = get_session_data()
+    s["wp"] = {"connected": False, "url": "", "user": "", "pass": ""}
+    log_activity("wp_disconnect", "ok")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/connect/wc", methods=["POST"])
+def api_connect_wc():
+    s = get_session_data()
+    d = request.json or {}
+    url = (d.get("url") or SITE_URL).rstrip("/")
+    ck = (d.get("ck") or "").strip()
+    cs = (d.get("cs") or "").strip()
+    s["pexels_key"] = (d.get("pexels") or "").strip()
+    if not ck.startswith("ck_") or not cs.startswith("cs_"):
+        return jsonify({"ok": False, "error": "ck_/cs_ prefix required"})
+    if not url.startswith("https://"):
+        return jsonify({"ok": False, "error": "HTTPS required"})
+    try:
+        r = requests.get(f"{url}/wp-json/wc/v3/system_status", auth=(ck, cs), timeout=15)
+        if r.status_code == 200:
+            s["wc"].update({"connected": True, "url": url, "ck": ck, "cs": cs})
+            log_activity("wc_connect", "ok")
+            return jsonify({"ok": True, "message": "WooCommerce connected"})
+        elif r.status_code == 401: return jsonify({"ok": False, "error": "Invalid keys (401)"})
+        return jsonify({"ok": False, "error": f"HTTP {r.status_code}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Network: {str(e)[:150]}"})
+
+
+@app.route("/api/test/wc", methods=["POST"])
+def api_test_wc():
+    d = request.json or {}
+    url = (d.get("url") or SITE_URL).rstrip("/")
+    ck = (d.get("ck") or "").strip()
+    cs = (d.get("cs") or "").strip()
+    if not ck or not cs: return jsonify({"ok": False, "error": "Credentials required"})
+    try:
+        r = requests.get(f"{url}/wp-json/wc/v3/system_status", auth=(ck, cs), timeout=15)
+        if r.status_code == 200: return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": f"HTTP {r.status_code}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:150]})
+
+
+@app.route("/api/disconnect/wc", methods=["POST"])
+def api_disconnect_wc():
+    s = get_session_data()
+    s["wc"] = {"connected": False, "url": "", "ck": "", "cs": ""}
+    log_activity("wc_disconnect", "ok")
+    return jsonify({"ok": True})
+
+
+# =============================================================================
+# SECTION 9 — STORE SETTINGS API
+# =============================================================================
+@app.route("/api/store/get", methods=["GET"])
+def api_store_get():
+    s = get_session_data()
+    return jsonify({"ok": True, "store": s["store"]})
+
+
+@app.route("/api/store/save", methods=["POST"])
+def api_store_save():
+    s = get_session_data()
+    d = request.json or {}
+    for k, v in d.items():
+        if v is not None: s["store"][k] = v
+    if CUSTOM_MODULES: engine.set_store(s["store"])
+    log_activity("store_save", "ok", f"name={s['store'].get('name')}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/store/reset", methods=["POST"])
+def api_store_reset():
+    s = get_session_data()
+    s["store"] = dict(STORE_DEFAULTS)
+    if CUSTOM_MODULES: engine.set_store(s["store"])
+    log_activity("store_reset", "ok")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/store/license", methods=["POST"])
+def api_store_license():
+    s = get_session_data()
+    d = request.json or {}
+    for k in ("license_type", "license_to", "license_key", "support_email"):
+        if k in d: s["store"][k] = d[k]
+    log_activity("license_save", "ok")
+    return jsonify({"ok": True})
+
+
+# =============================================================================
+# SECTION 10 — CONFIG EXPORT/IMPORT
+# =============================================================================
+@app.route("/api/config/export", methods=["GET"])
+def api_config_export():
+    s = get_session_data()
+    config = {"version": APP_VERSION,
+              "exported_at": datetime.datetime.now().isoformat(),
+              "store": s["store"], "site_url": SITE_URL,
+              "notes": "Credentials NOT included."}
+    log_activity("config_export", "ok")
+    return jsonify({"ok": True, "config": config})
+
+
+@app.route("/api/config/import", methods=["POST"])
+def api_config_import():
+    s = get_session_data()
+    cfg = (request.json or {}).get("config") or {}
+    if "store" in cfg and isinstance(cfg["store"], dict):
+        for k, v in cfg["store"].items(): s["store"][k] = v
+        if CUSTOM_MODULES: engine.set_store(s["store"])
+    log_activity("config_import", "ok")
+    return jsonify({"ok": True})
+
+
+# =============================================================================
+# SECTION 11 — PRODUCTS API
+# =============================================================================
+def _clean_product_name(line):
+    line = line.strip().strip(",")
+    line = re.sub(r'^\d+\s+', '', line)
+    if line.startswith('"') and line.endswith('"'): line = line[1:-1]
+    return line.strip()
+
+
+@app.route("/api/products/load", methods=["POST"])
+def api_products_load():
+    s = get_session_data()
+    if "file" not in request.files: return jsonify({"ok": False, "error": "No file"})
+    f = request.files["file"]
+    text = f.read().decode("utf-8", errors="replace")
+    lines = [l for l in text.splitlines() if l.strip()]
+    cleaned = [_clean_product_name(l) for l in lines]
+    cleaned = [c for c in cleaned if c and not re.match(r'^C\d:', c)]
+    s["raw_products"] = cleaned
+    log_activity("load_products", "ok", f"count={len(cleaned)}")
+    return jsonify({"ok": True, "count": len(cleaned)})
+
+
+@app.route("/api/products/load-text", methods=["POST"])
+def api_products_load_text():
+    s = get_session_data()
+    text = (request.json or {}).get("text", "")
+    lines = [l for l in text.splitlines() if l.strip()]
+    cleaned = [_clean_product_name(l) for l in lines if _clean_product_name(l)]
+    s["raw_products"].extend(cleaned)
+    return jsonify({"ok": True, "count": len(cleaned), "total": len(s["raw_products"])})
+
+
+@app.route("/api/products/load-demo", methods=["POST"])
+def api_products_load_demo():
+    s = get_session_data()
+    demo = ["Almond Oil", "Black Seed Oil", "Olive Oil", "Coconut Oil", "Mustard Oil"]
+    s["raw_products"] = demo
+    return jsonify({"ok": True, "count": len(demo)})
+
+
+@app.route("/api/products/clear", methods=["POST"])
+def api_products_clear():
+    s = get_session_data()
+    s["raw_products"] = []; s["built_products"] = []; s["slot_managers"] = {}
+    return jsonify({"ok": True})
+
+
+@app.route("/api/products/list", methods=["GET"])
+def api_products_list():
+    s = get_session_data()
+    summary = []
+    for p in s["built_products"]:
+        summary.append({"index": p.get("index"), "name": p.get("name"),
+                        "sku": p.get("sku"), "slug": p.get("slug"),
+                        "price": p.get("price", 0), "stock": p.get("stock", 0),
+                        "category_name": p.get("category_name"),
+                        "rankmath_score": p.get("rankmath_score", 0)})
+    return jsonify({"ok": True, "count": len(summary), "products": summary})
+
+
+@app.route("/api/products/generate", methods=["POST"])
+def api_products_generate():
+    s = get_session_data()
+    if not CUSTOM_MODULES:
+        return jsonify({"ok": False, "error": "engine.py or media.py missing"})
+    names = s["raw_products"]
+    if not names: return jsonify({"ok": False, "error": "Load products first"})
+    engine.set_store(s["store"])
+    try:
+        built = engine.build_all_products(names)
+    except Exception as e:
+        log_activity("generate_products", "fail", str(e)[:200])
+        return jsonify({"ok": False, "error": f"Generation failed: {str(e)[:200]}"})
+    d = request.json or {}
+    try:
+        pmin = int(d.get("price_min") or PRICE_MIN)
+        pmax = int(d.get("price_max") or PRICE_MAX)
+        stock_count = int(d.get("stock_count") or 10)
+        stock_qty = int(d.get("stock_qty") or 25)
+    except Exception:
+        pmin, pmax, stock_count, stock_qty = PRICE_MIN, PRICE_MAX, 10, 25
+    import random as _r
+    _r.seed(42)
+    for i, p in enumerate(built):
+        p["price"] = round(_r.uniform(pmin, pmax), 2)
+        p["stock"] = stock_qty if i < stock_count else 0
+        p["stock_status"] = "instock" if p["stock"] > 0 else "outofstock"
+    s["built_products"] = built
+    summary = engine.summarize_scores(built)
+    log_activity("generate_products", "ok", f"count={len(built)} avg={summary['avg']}")
+    return jsonify({"ok": True, "count": len(built),
+                    "avg_score": summary["avg"], "passing": summary["passing"],
+                    "failing": summary["failing"]})
+
+
+# =============================================================================
+# SECTION 12 — IMAGE STUDIO API
+# =============================================================================
+def _get_or_create_slot_manager(product_name):
+    s = get_session_data()
+    if product_name not in s["slot_managers"]:
+        if CUSTOM_MODULES:
+            s["slot_managers"][product_name] = media.SlotManager(product_name)
+        else:
+            return None
+    return s["slot_managers"][product_name]
+
+
+@app.route("/api/images/slots", methods=["POST"])
+def api_images_slots():
+    d = request.json or {}
+    product = d.get("product", "")
+    if not product: return jsonify({"ok": False, "error": "Product required"})
+    sm = _get_or_create_slot_manager(product)
+    if sm is None:
+        return jsonify({"ok": True, "slots": [{"status": "empty", "thumb_url": None} for _ in range(5)]})
+    slots = []
+    for i in range(5):
+        slot = sm.slots[i]
+        status = slot.get("status", "empty")
+        path = slot.get("path")
+        thumb_url = None
+        if path and Path(path).exists():
+            thumb_url = f"/api/images/thumb?p={base64.urlsafe_b64encode(path.encode()).decode()}"
+        slots.append({"status": status, "thumb_url": thumb_url})
+    return jsonify({"ok": True, "slots": slots})
+
+
+@app.route("/api/images/thumb", methods=["GET"])
+def api_images_thumb():
+    try:
+        p = request.args.get("p", "")
+        path = base64.urlsafe_b64decode(p.encode()).decode()
+        p_path = Path(path)
+        if not p_path.exists() or not p_path.is_file():
+            return Response("Not found", status=404)
+        try:
+            p_path.resolve().relative_to(WORKSPACE.resolve())
+        except ValueError:
+            return Response("Forbidden", status=403)
+        return send_file(str(p_path), mimetype="image/webp")
+    except Exception:
+        return Response("Error", status=400)
+
+
+@app.route("/api/images/upload", methods=["POST"])
+def api_images_upload():
+    if not CUSTOM_MODULES: return jsonify({"ok": False, "error": "media.py missing"})
+    if "file" not in request.files: return jsonify({"ok": False, "error": "No file"})
+    file = request.files["file"]
+    product = request.form.get("product", "")
+    slot = int(request.form.get("slot", 0))
+    size = request.form.get("size", "1200x1200")
+    aspect = request.form.get("aspect", "1:1")
+    quality = int(request.form.get("quality", 80))
+    if not product: return jsonify({"ok": False, "error": "Product required"})
+    raw_name = f"{uuid.uuid4().hex}_{file.filename}"
+    raw_path = UPLOAD_DIR / raw_name
+    file.save(str(raw_path))
+    try:
+        w, h = size.lower().split("x")
+        target = (int(w), int(h))
+    except Exception:
+        target = (1200, 1200)
+    try:
+        ok, final = media.process_image_pipeline(str(raw_path), target, aspect=aspect, quality=quality)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Processing: {str(e)[:150]}"})
+    if not ok: return jsonify({"ok": False, "error": final})
+    sm = _get_or_create_slot_manager(product)
+    if sm is None: return jsonify({"ok": False, "error": "Slot manager unavailable"})
+    sm.assign(slot, final)
+    log_activity("image_assign", "ok", f"{product} slot={slot+1}")
+    return jsonify({"ok": True, "path": final})
+
+
+@app.route("/api/images/download-url", methods=["POST"])
+def api_images_download_url():
+    if not CUSTOM_MODULES: return jsonify({"ok": False, "error": "media.py missing"})
+    d = request.json or {}
+    product = d.get("product", "")
+    url = d.get("url", "")
+    slot = int(d.get("slot", 0))
+    size = d.get("size", "1200x1200")
+    aspect = d.get("aspect", "1:1")
+    quality = int(d.get("quality", 80))
+    if not product or not url: return jsonify({"ok": False, "error": "Product and URL required"})
+    if not url.startswith(("http://", "https://")): return jsonify({"ok": False, "error": "URL must be http(s)"})
+    ok, result = media.download_from_url(url)
+    if not ok: return jsonify({"ok": False, "error": f"Download: {result}"})
+    try:
+        w, h = size.lower().split("x")
+        target = (int(w), int(h))
+    except Exception:
+        target = (1200, 1200)
+    ok, final = media.process_image_pipeline(result, target, aspect=aspect, quality=quality)
+    if not ok: return jsonify({"ok": False, "error": final})
+    sm = _get_or_create_slot_manager(product)
+    if sm is None: return jsonify({"ok": False, "error": "Slot manager unavailable"})
+    sm.assign(slot, final, url)
+    log_activity("image_download", "ok", f"{product} slot={slot+1}")
+    return jsonify({"ok": True, "path": final})
+
+
+# =============================================================================
+# SECTION 13 — CONTENT API
+# =============================================================================
+@app.route("/api/content/product", methods=["POST"])
+def api_content_product():
+    s = get_session_data()
+    name = (request.json or {}).get("name", "")
+    if not name: return jsonify({"ok": False, "error": "Product required"})
+    p = next((x for x in s["built_products"] if x["name"] == name), None)
+    if not p: return jsonify({"ok": False, "error": "Product not found"})
+    rm = p.get("rankmath", {})
+    seo_text = (
+        f"Focus Keyword:    {p['keywords'].get('focus','')}\n"
+        f"SEO Title:        {rm.get('meta:rank_math_title','')}\n"
+        f"                  ({len(rm.get('meta:rank_math_title',''))} chars)\n"
+        f"Meta Description: {rm.get('meta:rank_math_description','')}\n"
+        f"                  ({len(rm.get('meta:rank_math_description',''))} chars)\n"
+        f"Canonical URL:    {p.get('canonical_url','')}\n"
+        f"Product URL:      {p.get('product_url','')}\n\n"
+        f"Word Count:       {p['article'].get('word_count',0)}\n"
+        f"Keyword Density:  {p['article'].get('keyword_density',0)}%\n"
+        f"RankMath Score:   {p.get('rankmath_score',0)}%"
+    )
+    kws = p.get("keywords", {})
+    kw_lines = []
+    for k, v in kws.items():
+        if isinstance(v, list):
+            kw_lines.append(f"\n{k.upper()}:")
+            for item in v: kw_lines.append(f"  • {item}")
+        else:
+            kw_lines.append(f"\n{k.upper()}: {v}")
+    return jsonify({"ok": True, "article_html": p["article"].get("html", ""),
+                    "seo_text": seo_text, "keywords_text": "\n".join(kw_lines),
+                    "score": p.get("rankmath_score", 0)})
+
+
+# =============================================================================
+# SECTION 14 — EXPORT API
+# =============================================================================
+@app.route("/api/export/csv", methods=["POST"])
+def api_export_csv():
+    if not CUSTOM_MODULES: return jsonify({"ok": False, "error": "engine.py missing"})
+    s = get_session_data()
+    products = s["built_products"]
+    if not products: return jsonify({"ok": False, "error": "No products"})
+    with_images = (request.json or {}).get("with_images", False)
+    image_map = {}
+    if with_images:
+        for name, sm in s["slot_managers"].items():
+            urls = getattr(sm, "media_urls", None) or []
+            image_map[name] = urls
+    cols, rows = engine.build_csv_data(products, image_map)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols)
+    writer.writeheader()
+    for row in rows: writer.writerow(row)
+    log_activity("csv_export", "ok", f"rows={len(rows)} with_images={with_images}")
+    return jsonify({"ok": True, "csv": buf.getvalue()})
+
+
+@app.route("/api/export/archive-css", methods=["GET"])
+def api_export_archive_css():
+    if not CUSTOM_MODULES: return jsonify({"ok": False, "error": "engine.py missing"})
+    return jsonify({"ok": True, "css": engine.get_archive_css()})
+
+
+# =============================================================================
+# SECTION 15 — PUSH API (FIXED — media_ids + media_urls)
+# =============================================================================
+@app.route("/api/push/wp", methods=["POST"])
+def api_push_wp():
+    s = get_session_data()
+    if not s["wp"]["connected"]:
+        return jsonify({"ok": False, "error": "Connect to WordPress first"})
+    if not CUSTOM_MODULES:
+        return jsonify({"ok": False, "error": "media.py missing"})
+    if not s["slot_managers"]:
+        return jsonify({"ok": False, "error": "No images assigned yet"})
+
+    ok_count = fail_count = 0
+    total_images = 0
+    errors = []
+    for name, sm in s["slot_managers"].items():
+        ok, media_ids, media_urls, err = media.upload_gallery_to_wp(
+            s["wp"]["url"], s["wp"]["user"], s["wp"]["pass"], sm, name)
+        if ok:
+            sm.media_ids = media_ids
+            sm.media_urls = media_urls
+            total_images += len(media_ids)
+            ok_count += 1
+        else:
+            fail_count += 1
+            errors.append(f"{name}: {err}")
+    log_activity("push_wp_images", "ok", f"ok={ok_count} fail={fail_count}")
+    return jsonify({
+        "ok": True,
+        "message": f"Pushed {ok_count} products' images ({total_images} files). Failed: {fail_count}",
+        "errors": errors[:10],
+    })
+
+
+@app.route("/api/push/wc", methods=["POST"])
+def api_push_wc():
+    s = get_session_data()
+    if not s["wc"]["connected"]:
+        return jsonify({"ok": False, "error": "Connect to WooCommerce first"})
+    if not CUSTOM_MODULES:
+        return jsonify({"ok": False, "error": "media.py missing"})
+    products = s["built_products"]
+    if not products:
+        return jsonify({"ok": False, "error": "No products"})
+
+    ok_count = fail_count = 0
+    images_attached = 0
+    errors = []
+    for p in products:
+        sm = s["slot_managers"].get(p["name"])
+        mids = getattr(sm, "media_ids", None) if sm else None
+        urls = getattr(sm, "media_urls", None) if sm else None
+        ok, data, err = media.push_product_via_wc_api(
+            s["wc"]["url"], s["wc"]["ck"], s["wc"]["cs"], p, mids, urls)
+        if ok:
+            ok_count += 1
+            attached = data.get("_attached_images", 0) if data else 0
+            images_attached += attached
+            if attached == 0 and (mids or urls):
+                errors.append(f"{p['name']}: pushed but 0 images attached")
+        else:
+            fail_count += 1
+            errors.append(f"{p['name']}: {err}")
+    log_activity("push_wc_products", "ok", f"ok={ok_count} fail={fail_count} imgs={images_attached}")
+    return jsonify({
+        "ok": True,
+        "message": f"Pushed {ok_count} products as drafts. Images attached: {images_attached}. Failed: {fail_count}",
+        "errors": errors[:10],
+    })
+
+
+# =============================================================================
+# SECTION 16 — TEST LAB API
+# =============================================================================
+@app.route("/api/test/publish", methods=["POST"])
+def api_test_publish():
+    s = get_session_data()
+    if not s["wc"]["connected"]:
+        return jsonify({"ok": False, "error": "Connect to WooCommerce first"})
+    if not CUSTOM_MODULES:
+        return jsonify({"ok": False, "error": "media.py missing"})
+    count = int((request.json or {}).get("count", 5))
+    try:
+        url = f"{s['wc']['url'].rstrip('/')}/wp-json/wc/v3/products"
+        r = requests.get(url, auth=(s["wc"]["ck"], s["wc"]["cs"]),
+                         params={"status": "draft", "per_page": 100}, timeout=20)
+        drafts = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if not drafts:
+        return jsonify({"ok": False, "error": "No draft products found"})
+    pub = 0
+    for p in drafts[:count]:
+        ok, err = media.publish_product(s["wc"]["url"], s["wc"]["ck"], s["wc"]["cs"], p["id"])
+        if ok: pub += 1
+    log_activity("publish_test", "ok", f"published={pub}/{count}")
+    return jsonify({"ok": True, "message": f"Published {pub}/{count} products"})
+
+
+# =============================================================================
+# SECTION 17 — LOG API
+# =============================================================================
+@app.route("/api/log", methods=["GET"])
+def api_log():
+    s = get_session_data()
+    return jsonify({"entries": s["activity_log"]})
+
+
+@app.route("/api/log/clear", methods=["POST"])
+def api_log_clear():
+    s = get_session_data()
+    s["activity_log"] = []
+    return jsonify({"ok": True})
+
+
+# =============================================================================
+# SECTION 18 — NETWORK HELPERS
+# =============================================================================
+def get_local_ip():
+    try:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.connect(("8.8.8.8", 80))
+        ip = sk.getsockname()[0]; sk.close(); return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def open_browser_delayed(port):
+    time.sleep(1.5)
+    try: webbrowser.open(f"http://127.0.0.1:{port}")
+    except Exception: pass
+
+
+# =============================================================================
+# SECTION 19 — ENTRY POINT
+# =============================================================================
+def main():
+    if CUSTOM_MODULES:
+        engine.set_store(STORE_DEFAULTS)
+    port = int(os.environ.get("PORT", DEFAULT_PORT))
+    local_ip = get_local_ip()
+    print("=" * 70)
+    print(f"  🌿 {APP_NAME}  v{APP_VERSION}")
+    print("=" * 70)
+    print(f"  Local:    http://127.0.0.1:{port}")
+    print(f"  Network:  http://{local_ip}:{port}    ← same WiFi")
+    print("=" * 70)
+    print(f"  Store:    {STORE_DEFAULTS['name']}")
+    print("  Ctrl+C to stop")
+    print("=" * 70)
+    threading.Thread(target=open_browser_delayed, args=(port,), daemon=True).start()
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()
